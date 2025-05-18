@@ -710,6 +710,39 @@ document.addEventListener('DOMContentLoaded', initializeApp);
 // Initialize the app
 // =====================================================
 
+// Add this function near the top, after AUDIO_CONFIG
+async function warmupTTS() {
+    try {
+        const response = await fetch(AUDIO_CONFIG.apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                text: 'This is a warmup for the speech system. Please ignore this message.',
+                voice: AUDIO_CONFIG.defaultVoice,
+                rate: AUDIO_CONFIG.rate,
+                pitch: AUDIO_CONFIG.pitch,
+                volume: AUDIO_CONFIG.volume
+            })
+        });
+        const audioBlob = await response.blob();
+        if (audioBlob.size === 0) return;
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl);
+        audio.volume = 0; // Mute the audio
+        await new Promise((resolve) => {
+            audio.onended = () => {
+                URL.revokeObjectURL(audioUrl);
+                resolve();
+            };
+            audio.play().catch(() => resolve());
+        });
+        // Add a small delay after warmup
+        await new Promise(res => setTimeout(res, 300));
+    } catch (e) {
+        // Ignore errors
+    }
+}
+
 async function initializeApp() {
     console.log('Starting app initialization...');
 
@@ -769,6 +802,9 @@ async function initializeApp() {
             elements.conversationModeToggle.disabled = false;
             updateStatus(MESSAGES.STATUS.DEFAULT);
         }, MIC_INITIALIZATION_DELAY);
+
+        // After all setup, before enabling conversation mode:
+        await warmupTTS();
 
         console.log('App initialization completed successfully');
 
@@ -1763,7 +1799,7 @@ async function getAIResponse(message, selectedModel, history, systemPrompt, sess
                             updateMessageContent(messageElement, currentChunk, tokenCount);
 
                             // Find sentences in the new chunk
-                            const sentences = currentChunk.slice(lastAudioIndex).match(/[^.!?]+[.!?]+/g);
+                            const sentences = splitTextIntoChunks(currentChunk.slice(lastAudioIndex));
                             if (sentences) {
                                 for (const sentence of sentences) {
                                     queueAudioChunk(sentence.trim()); // No await!
@@ -2109,20 +2145,29 @@ async function getPersonalInfo(key = null) {
 
 // Split text into chunks function
 function splitTextIntoChunks(text, maxLength = 200) {
+    // Define honorifics pattern
+    const honorifics = /(?:Mr\.|Mrs\.|Dr\.|Sr\.|Jr\.|Ms\.|Prof\.|Rev\.|Capt\.|Lt\.|Col\.|Gen\.|Sgt\.|Cpl\.|Pvt\.|St\.)/g;
+    
+    // Replace honorifics with a temporary marker
+    const tempText = text.replace(honorifics, match => match.replace('.', 'DOT'));
+    
     // Split text into sentences, keeping the punctuation
-    const sentences = text.match(/[^.!?]+[.!?]+(?:\s|$)/g) || [text];
+    const sentences = tempText.match(/[^.!?]+[.!?]+(?:\s|$)/g) || [tempText];
     const chunks = [];
     let currentChunk = '';
 
     for (const sentence of sentences) {
-        if (currentChunk.length + sentence.length > maxLength) {
+        // Restore honorifics in the sentence
+        const restoredSentence = sentence.replace(/DOT/g, '.');
+        
+        if (currentChunk.length + restoredSentence.length > maxLength) {
             if (currentChunk) {
                 chunks.push(currentChunk.trim());
                 currentChunk = '';
             }
-            if (sentence.length > maxLength) {
+            if (restoredSentence.length > maxLength) {
                 // Split long sentences into words
-                const words = sentence.split(/\s+/);
+                const words = restoredSentence.split(/\s+/);
                 for (const word of words) {
                     if (currentChunk.length + word.length > maxLength) {
                         chunks.push(currentChunk.trim());
@@ -2131,10 +2176,10 @@ function splitTextIntoChunks(text, maxLength = 200) {
                     currentChunk += (currentChunk ? ' ' : '') + word;
                 }
             } else {
-                currentChunk = sentence;
+                currentChunk = restoredSentence;
             }
         } else {
-            currentChunk += (currentChunk ? ' ' : '') + sentence;
+            currentChunk += (currentChunk ? ' ' : '') + restoredSentence;
         }
     }
     if (currentChunk) {
@@ -2228,18 +2273,27 @@ async function playNextInQueue() {
         return;
     }
     try {
+        // Warmup TTS if not already done
+        if (!window.ttsWarmedUp) {
+            await warmupTTS();
+            window.ttsWarmedUp = true;
+        }
         state.isPlaying = true;
         state.isAISpeaking = true;
         updateStatus(MESSAGES.STATUS.SPEAKING);
         elements.stopAudioButton.style.display = 'inline-block';
-        const text = state.audioQueue[0];
-        console.log('Playing chunk:', text);
-
+        let text = state.audioQueue[0];
+        let ttsText = text;
+        if (!window.ttsPrimed) {
+            ttsText = DUMMY_PREFIX + text;
+            window.ttsPrimed = true;
+        }
+        console.log('Playing chunk:', ttsText);
         const response = await fetch(AUDIO_CONFIG.apiUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                text: text,
+                text: ttsText,
                 voice: AUDIO_CONFIG.defaultVoice,
                 rate: AUDIO_CONFIG.rate,
                 pitch: AUDIO_CONFIG.pitch,
@@ -2261,18 +2315,23 @@ async function playNextInQueue() {
         state.currentAudio.volume = AUDIO_CONFIG.volume;
         console.log('Attempting to play audio:', audioUrl);
 
-        state.currentAudio.addEventListener('canplaythrough', () => {
-            state.currentAudio.currentTime = 0; // Ensure playback starts at the very beginning
-            const delay = isFirstAudioPlayback ? 400 : 100;
-            setTimeout(() => {
-                state.currentAudio.play().then(() => {
-                    console.log('Audio playback started');
-                }).catch(e => {
-                    console.error('Audio playback error:', e);
-                });
-                isFirstAudioPlayback = false;
-            }, delay);
-        }, { once: true });
+        // Wait for canplaythrough before playing
+        await new Promise((resolve, reject) => {
+            state.currentAudio.addEventListener('canplaythrough', () => {
+                state.currentAudio.currentTime = 0;
+                const delay = (typeof isFirstAudioPlayback !== 'undefined' && isFirstAudioPlayback) ? 400 : 100;
+                setTimeout(() => {
+                    state.currentAudio.play().then(() => {
+                        console.log('Audio playback started');
+                    }).catch(e => {
+                        console.error('Audio playback error:', e);
+                    });
+                    if (typeof isFirstAudioPlayback !== 'undefined') isFirstAudioPlayback = false;
+                }, delay);
+                resolve();
+            }, { once: true });
+            state.currentAudio.onerror = reject;
+        });
 
         await new Promise((resolve, reject) => {
             state.currentAudio.onended = resolve;
@@ -2296,11 +2355,15 @@ async function playNextInQueue() {
         }
     } catch (error) {
         console.error('Audio playback error:', error);
+        if (state.currentAudio) {
+            state.currentAudio.pause();
+            state.currentAudio = null;
+        }
+        state.audioQueue.shift();
         state.isPlaying = false;
         state.isAISpeaking = false;
         elements.stopAudioButton.style.display = 'none';
         safeUpdateListeningStatus();
-        
         if (state.audioQueue.length > 0) {
             setTimeout(() => playNextInQueue(), AUDIO_CONFIG.retryDelay);
         }
@@ -2462,18 +2525,27 @@ async function playNextInQueue() {
         return;
     }
     try {
+        // Warmup TTS if not already done
+        if (!window.ttsWarmedUp) {
+            await warmupTTS();
+            window.ttsWarmedUp = true;
+        }
         state.isPlaying = true;
         state.isAISpeaking = true;
         updateStatus(MESSAGES.STATUS.SPEAKING);
         elements.stopAudioButton.style.display = 'inline-block';
-        const text = state.audioQueue[0];
-        console.log('Playing chunk:', text);
-
+        let text = state.audioQueue[0];
+        let ttsText = text;
+        if (!window.ttsPrimed) {
+            ttsText = DUMMY_PREFIX + text;
+            window.ttsPrimed = true;
+        }
+        console.log('Playing chunk:', ttsText);
         const response = await fetch(AUDIO_CONFIG.apiUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                text: text,
+                text: ttsText,
                 voice: AUDIO_CONFIG.defaultVoice,
                 rate: AUDIO_CONFIG.rate,
                 pitch: AUDIO_CONFIG.pitch,
@@ -2495,13 +2567,23 @@ async function playNextInQueue() {
         state.currentAudio.volume = AUDIO_CONFIG.volume;
         console.log('Attempting to play audio:', audioUrl);
 
-        state.currentAudio.addEventListener('canplaythrough', () => {
-            state.currentAudio.play().then(() => {
-                console.log('Audio playback started');
-            }).catch(e => {
-                console.error('Audio playback error:', e);
-            });
-        }, { once: true });
+        // Wait for canplaythrough before playing
+        await new Promise((resolve, reject) => {
+            state.currentAudio.addEventListener('canplaythrough', () => {
+                state.currentAudio.currentTime = 0;
+                const delay = (typeof isFirstAudioPlayback !== 'undefined' && isFirstAudioPlayback) ? 400 : 100;
+                setTimeout(() => {
+                    state.currentAudio.play().then(() => {
+                        console.log('Audio playback started');
+                    }).catch(e => {
+                        console.error('Audio playback error:', e);
+                    });
+                    if (typeof isFirstAudioPlayback !== 'undefined') isFirstAudioPlayback = false;
+                }, delay);
+                resolve();
+            }, { once: true });
+            state.currentAudio.onerror = reject;
+        });
 
         await new Promise((resolve, reject) => {
             state.currentAudio.onended = resolve;
@@ -2509,26 +2591,31 @@ async function playNextInQueue() {
         });
 
         URL.revokeObjectURL(audioUrl);
-        state.audioQueue.shift();  // Remove played chunk
+        state.audioQueue.shift();
         state.isPlaying = false;
 
-        // Process next chunk if available
         if (state.audioQueue.length > 0 && !state.stopRequested) {
-            setTimeout(() => playNextInQueue(), AUDIO_CONFIG.pauseDuration);
+            setTimeout(() => {
+                state.isPlaying = false;
+                playNextInQueue();
+            }, AUDIO_CONFIG.pauseDuration);
         } else {
             state.isPlaying = false;
             state.isAISpeaking = false;
             elements.stopAudioButton.style.display = 'none';
             safeUpdateListeningStatus();
         }
-
     } catch (error) {
         console.error('Audio playback error:', error);
+        if (state.currentAudio) {
+            state.currentAudio.pause();
+            state.currentAudio = null;
+        }
+        state.audioQueue.shift();
         state.isPlaying = false;
         state.isAISpeaking = false;
         elements.stopAudioButton.style.display = 'none';
         safeUpdateListeningStatus();
-        
         if (state.audioQueue.length > 0) {
             setTimeout(() => playNextInQueue(), AUDIO_CONFIG.retryDelay);
         }
@@ -2705,10 +2792,10 @@ async function handleImageAnalysis(imageData, prompt = '') {
                             }
 
                             // Queue audio for complete sentences
-                            const sentences = currentChunk.match(/[^.!?]+[.!?]+/g);
-                            if (sentences) {
+                            const sentences = splitTextIntoChunks(currentChunk);
+                            if (sentences.length) {
                                 queueAudioChunk(sentences.join(' '));
-                                currentChunk = currentChunk.replace(sentences.join(''), '');
+                                currentChunk = '';
                             }
                         }
                     } catch (e) {
@@ -4387,24 +4474,27 @@ async function playNextInQueue() {
         state.isAISpeaking = true;
         updateStatus(MESSAGES.STATUS.SPEAKING);
         elements.stopAudioButton.style.display = 'inline-block';
-        const text = state.audioQueue[0];
-        console.log('Playing chunk:', text);
-
+        let text = state.audioQueue[0];
+        let ttsText = text;
+        if (!window.ttsPrimed) {
+            ttsText = DUMMY_PREFIX + text;
+            window.ttsPrimed = true;
+        }
+        console.log('Playing chunk:', ttsText);
         const response = await fetch(AUDIO_CONFIG.apiUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                text: text,
+                text: ttsText,
                 voice: AUDIO_CONFIG.defaultVoice,
                 rate: AUDIO_CONFIG.rate,
                 pitch: AUDIO_CONFIG.pitch,
                 volume: AUDIO_CONFIG.volume
             })
         });
-
-        if (!response.ok) throw new Error(`TTS API error: ${response.status}`);
-        
+        console.log('TTS fetch response:', response);
         const audioBlob = await response.blob();
+        console.log('audioBlob size:', audioBlob.size);
         if (audioBlob.size === 0) throw new Error('Empty audio response');
 
         cleanup(state.currentAudio);
@@ -4673,3 +4763,10 @@ function safeUpdateListeningStatus() {
         updateStatus(MESSAGES.STATUS.LISTENING);
     }
 }
+
+// At the top of the file, after AUDIO_CONFIG or near other globals
+window.ttsWarmedUp = false;
+
+// Add at the top, after other global flags
+window.ttsPrimed = false;
+const DUMMY_PREFIX = "....................... ";

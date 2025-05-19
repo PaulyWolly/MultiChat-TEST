@@ -17,6 +17,10 @@ const SERVER_URL = 'http://localhost:32300';
 const INTERVAL = 10;  // Set timeout duration in minutes
 const CONVERSATION_INACTIVITY_TIMEOUT = INTERVAL * 60 * 1000;  // Convert minutes to milliseconds
 
+// TTS Constants
+window.ttsPrimed = false;
+const DUMMY_PREFIX = ".............";
+
 // Memory categories
 const MEMORY_CATEGORIES = {
     event: /(?:tomorrow|next|on|at)\s+(.+)/i,
@@ -745,6 +749,10 @@ async function warmupTTS() {
 
 async function initializeApp() {
     console.log('Starting app initialization...');
+
+    // Initialize TTS flags
+    window.ttsWarmedUp = false;
+    // window.ttsPrimed = false;  // Remove this line since it's now in constants
 
     // Disable conversation mode toggle initially
     elements.conversationModeToggle.disabled = true;
@@ -2237,28 +2245,10 @@ async function populateVoiceList() {
 // Update the playAudio function
 async function playAudio(text) {
     if (!text) return;
-
-    try {
-        state.isAISpeaking = true;
-        state.isPlaying = true;
-        safeUpdateListeningStatus();
-        elements.stopAudioButton.style.display = 'inline-block';  // Show the button
-
-        // ... rest of playAudio function ...
-
-    } catch (error) {
-        console.error('Error playing audio:', error);
-    } finally {
-        state.isAISpeaking = false;
-        state.isPlaying = false;
-        elements.stopAudioButton.style.display = 'none';
-        if (state.isConversationMode) {
-            safeUpdateListeningStatus();
-        } else {
-            // updateStatus('Ready');
-            console.log('Ready');
-        }
-    }
+    const chunks = splitTextIntoChunks(text);
+    state.audioQueue = [...chunks];
+    state.stopRequested = false;
+    playNextInQueue();
 }
 
 // Update the playNextInQueue function
@@ -2315,7 +2305,6 @@ async function playNextInQueue() {
         state.currentAudio.volume = AUDIO_CONFIG.volume;
         console.log('Attempting to play audio:', audioUrl);
 
-        // Wait for canplaythrough before playing
         await new Promise((resolve, reject) => {
             state.currentAudio.addEventListener('canplaythrough', () => {
                 state.currentAudio.currentTime = 0;
@@ -2348,8 +2337,8 @@ async function playNextInQueue() {
                 playNextInQueue();
             }, AUDIO_CONFIG.pauseDuration);
         } else {
-            state.isPlaying = false;
             state.isAISpeaking = false;
+            state.isPlaying = false;
             elements.stopAudioButton.style.display = 'none';
             safeUpdateListeningStatus();
         }
@@ -2453,6 +2442,7 @@ function resetAudioState() {
     state.isPlaying = false;
     state.isAISpeaking = false;
     state.audioQueue = [];
+    window.ttsPrimed = false;  // Reset TTS primed flag
 
     console.log('Audio state reset. New state:', {
         stopRequested: state.stopRequested,
@@ -2493,20 +2483,11 @@ function stopAudioPlayback() {
 async function queueAudioChunk(text) {
     console.log('queueAudioChunk called with:', text);
     if (!text) return;
-
-    // Do NOT reset the queue here!
-    // state.audioQueue = [];
-    // state.stopRequested = false;
-    // state.isAISpeaking = true;
-    // updateStatus(MESSAGES.STATUS.SPEAKING);
-
     // Split text into sentences/chunks
     const chunks = splitTextIntoChunks(text);
-
     // Add new chunks to the queue
     state.audioQueue.push(...chunks);
     console.log('Queued chunks:', state.audioQueue);
-
     // Only start playback if not already playing
     if (!state.isPlaying && !state.stopRequested) {
         await playNextInQueue();
@@ -2567,7 +2548,6 @@ async function playNextInQueue() {
         state.currentAudio.volume = AUDIO_CONFIG.volume;
         console.log('Attempting to play audio:', audioUrl);
 
-        // Wait for canplaythrough before playing
         await new Promise((resolve, reject) => {
             state.currentAudio.addEventListener('canplaythrough', () => {
                 state.currentAudio.currentTime = 0;
@@ -2600,8 +2580,8 @@ async function playNextInQueue() {
                 playNextInQueue();
             }, AUDIO_CONFIG.pauseDuration);
         } else {
-            state.isPlaying = false;
             state.isAISpeaking = false;
+            state.isPlaying = false;
             elements.stopAudioButton.style.display = 'none';
             safeUpdateListeningStatus();
         }
@@ -4470,6 +4450,11 @@ async function playNextInQueue() {
         return;
     }
     try {
+        // Warmup TTS if not already done
+        if (!window.ttsWarmedUp) {
+            await warmupTTS();
+            window.ttsWarmedUp = true;
+        }
         state.isPlaying = true;
         state.isAISpeaking = true;
         updateStatus(MESSAGES.STATUS.SPEAKING);
@@ -4497,7 +4482,10 @@ async function playNextInQueue() {
         console.log('audioBlob size:', audioBlob.size);
         if (audioBlob.size === 0) throw new Error('Empty audio response');
 
-        cleanup(state.currentAudio);
+        if (state.currentAudio) {
+            state.currentAudio.pause();
+            state.currentAudio = null;
+        }
         
         const audioUrl = URL.createObjectURL(audioBlob);
         state.currentAudio = new Audio(audioUrl);
@@ -4769,4 +4757,29 @@ window.ttsWarmedUp = false;
 
 // Add at the top, after other global flags
 window.ttsPrimed = false;
-const DUMMY_PREFIX = "....................... ";
+
+function listeningMode() {
+    updateStatus(MESSAGES.STATUS.LISTENING);
+    elements.stopAudioButton.style.display = 'none';
+    if (!state.isListening && !state.isProcessing && !state.isAISpeaking) {
+        console.log('Enabling microphone in listeningMode. State:', {
+          isListening: state.isListening,
+          isProcessing: state.isProcessing,
+          isAISpeaking: state.isAISpeaking
+        });
+        startListening();
+    }
+    state.isAISpeaking = false;
+    state.isPlaying = false;
+    state.isProcessing = false;
+}
+
+function aiSpeakingMode() {
+    updateStatus(MESSAGES.STATUS.SPEAKING);
+    elements.stopAudioButton.style.display = 'inline-block';
+    if (state.isListening) {
+        stopListening();
+    }
+    state.isAISpeaking = true;
+    state.isPlaying = true;
+}
